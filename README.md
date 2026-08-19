@@ -6,7 +6,7 @@
    ██║    ██║ ██║  ██║ ██║  ██║ ██║ ╚═╝ ██║ ██║ ███████║ ╚██████╔╝
    ╚═╝    ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝     ╚═╝ ╚═╝ ╚══════╝  ╚═════╝
 ```
-I just added quality weights in the config, because the original prject uses a hard coded variant. GLHF. I made this for me mostly, gl hf
+I just added quality weights in the config, because the original prject uses a hard coded variant.I made this for me mostly, gl hf
 
 
 <h1><sub><sub><strong>Tiramisu</strong> is the most advanced BitTorrent engine and FUSE virtual filesystem for live streaming to your private Plex/Jellyfin library. Forget Real-Debrid.</sub></sub></h1>
