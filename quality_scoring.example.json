@@ -1,0 +1,32 @@
+{
+  "quality_scoring": {
+    "movies": {
+      "res_4k": 1000,
+      "res_1080p": 200,
+      "dolby_vision": 100,
+      "hdr": 60,
+      "atmos": 50,
+      "audio_5_1": 25,
+      "stereo_penalty": -50,
+      "neutral_audio_bonus": 5,
+      "remux_bonus": 30,
+      "ita_bonus": 60,
+      "unknown_size_penalty": -5,
+      "seeder_weight": 1,
+      "seeder_cap": 50,
+      "disable_4k": false
+    },
+    "tv": {
+      "res_4k": 1000,
+      "res_1080p": 200,
+      "hdr": 100,
+      "atmos": 50,
+      "audio_5_1": 25,
+      "ita_bonus": 40,
+      "fullpack_bonus": 500,
+      "seeder_weight": 1,
+      "seeder_cap": 100,
+      "disable_4k": false
+    }
+  }
+}
