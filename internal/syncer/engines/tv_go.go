@@ -38,6 +38,7 @@ type TVGoEngine struct {
 	stateDir  string
 	limiter   *rate.Limiter
 	logger    *log.Logger
+	weights   config.TVWeights
 
 	registry     map[string]TVEpisodeEntry
 	registryFile string
@@ -89,17 +90,17 @@ type TVEngineConfig struct {
 	// layer drops its cached state for it (see main.invalidateSyncRemovedPath).
 	InvalidatePath func(string)
 	Language       config.LanguageConfig
+	// Weights configures scoring weights for stream selection. Nil means
+	// "use config.DefaultTVWeights()".
+	Weights *config.TVWeights
 }
 
-// TV thresholds
+// TV thresholds (non-scoring, still hardcoded on purpose: these are
+// sanity/size bounds, not quality preferences). Note tvMinQualitySkip is
+// calibrated against the default Res4K weight (1000) — if you configure a
+// very different Res4K weight, "complete season" skip-detection may behave
+// differently than before.
 const (
-	tv4KBase           = 1000
-	tv1080pBase        = 200
-	tvHDRBonus         = 100
-	tvAtmosBonus       = 50
-	tv51Bonus          = 25
-	tvITABonus         = 40
-	tvFullpackBonus    = 500
 	tvMinSeeders4K     = 5
 	tvMinSeeders       = 5
 	tvMinEpisodeSize   = 1073741824  // 1GB
@@ -156,7 +157,13 @@ func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 	regFile := filepath.Join(cfg.StateDir, "tv_episode_registry.json")
 	blFile := filepath.Join(cfg.StateDir, "blacklist.json")
 
+	weights := config.DefaultTVWeights()
+	if cfg.Weights != nil {
+		weights = *cfg.Weights
+	}
+
 	e := &TVGoEngine{
+		weights:          weights,
 		gostorm:          NewGoStormClient(cfg.GoStormURL),
 		tmdb:             tmdb.NewClient(cfg.TMDBAPIKey),
 		torrentio:        torrentio.NewClient(cfg.TorrentioURL, "sort=qualitysize|qualityfilter=480p,720p,scr,cam"),
@@ -873,6 +880,9 @@ func (e *TVGoEngine) classifyStream(s prowlarr.Stream) *TVStream {
 	}
 
 	is4K := reTV4K.MatchString(fullText)
+	if is4K && e.weights.Disable4K {
+		return nil
+	}
 	minReq := tvMinSeeders4K
 	if !is4K {
 		minReq = tvMinSeeders
@@ -901,9 +911,9 @@ func (e *TVGoEngine) classifyStream(s prowlarr.Stream) *TVStream {
 	priorityBonus := 0
 	if isFullpack {
 		if isPartialPack {
-			priorityBonus = tvFullpackBonus / 2
+			priorityBonus = e.weights.FullpackBonus / 2
 		} else {
-			priorityBonus = tvFullpackBonus
+			priorityBonus = e.weights.FullpackBonus
 		}
 	}
 
@@ -922,38 +932,37 @@ func (e *TVGoEngine) classifyStream(s prowlarr.Stream) *TVStream {
 }
 
 func (e *TVGoEngine) calculateQualityScore(text string, seeders int) int {
+	w := e.weights
 	t := strings.ToLower(text)
 	score := 0
 
 	if reTV4K.MatchString(t) {
-		score += tv4KBase
+		score += w.Res4K
 	} else if reTV1080p.MatchString(t) {
-		score += tv1080pBase
+		score += w.Res1080p
 	} else {
 		return 0
 	}
 
 	if reTVHDR.MatchString(t) {
-		score += tvHDRBonus
+		score += w.HDR
 	}
 
 	if reTVAtmos.MatchString(t) {
-		score += tvAtmosBonus
+		score += w.Atmos
 	} else if reTV51.MatchString(t) {
-		score += tv51Bonus
+		score += w.Audio51
 	}
 
 	if e.reITA.MatchString(t) {
-		score += tvITABonus
+		score += w.ItaBonus
 	}
 
-	if seeders >= 100 {
-		score += 100
-	} else if seeders >= 50 {
-		score += 50
-	} else if seeders >= 20 {
-		score += 10
+	seederBonus := seeders
+	if seederBonus > w.SeederCap {
+		seederBonus = w.SeederCap
 	}
+	score += seederBonus * w.SeederWeight
 
 	return score
 }

@@ -31,6 +31,9 @@ type MoviesSyncerConfig struct {
 	// InvalidatePath, when set, is called after removing a stub file so the FUSE
 	// layer drops its cached state for it (see main.invalidateSyncRemovedPath).
 	InvalidatePath func(string)
+	// Weights configures scoring weights for stream selection. Nil means
+	// "use config.DefaultMovieWeights()".
+	Weights *config.MovieWeights
 }
 
 // NewMoviesSyncer creates a new Go-based movie syncer.
@@ -64,6 +67,7 @@ func NewMoviesSyncer(cfg MoviesSyncerConfig) *MoviesSyncer {
 		ProwlarrCfg:    cfg.ProwlarrCfg,
 		Language:       cfg.Language,
 		InvalidatePath: cfg.InvalidatePath,
+		Weights:        cfg.Weights,
 	}
 
 	return &MoviesSyncer{

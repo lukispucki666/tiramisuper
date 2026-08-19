@@ -50,31 +50,119 @@ type EngineConfig struct {
 	LogsDir    string
 }
 
-// QualityWeights defines scoring weights for movie selection.
-type QualityWeights struct {
-	Res4K           int `json:"res_4k"`
-	Res1080p        int `json:"res_1080p"`
-	HDR             int `json:"hdr"`
-	DolbyVision     int `json:"dolby_vision"`
-	HDR10Plus       int `json:"hdr10_plus"`
-	Atmos           int `json:"atmos"`
-	Audio51         int `json:"audio_5_1"`
-	Stereo          int `json:"stereo"`
-	BluRay          int `json:"bluray"`
-	SeederBonus     int `json:"seeder_bonus"`
-	SeederThreshold int `json:"seeder_threshold"`
+// MovieWeights defines scoring weights used by the Movie sync engine
+// (internal/syncer/engines/movie_go.go, calculateMovieScore/classifyMovieStream).
+//
+// SeederWeight/SeederCap replace the old hardcoded "score += min(seeders, 50)":
+// the contribution is now min(seeders, SeederCap) * SeederWeight, so setting
+// SeederWeight high (e.g. 1000) lets seeders dominate every other field.
+//
+// Disable4K, when true, makes the engine reject 4K releases outright during
+// classification, so 1080p is always chosen instead. This exists because 4K
+// and 1080p candidates are filtered into separate pools before scoring, and
+// any available 4K pool always wins regardless of score — a negative Res4K
+// weight alone would NOT be enough to make 1080p win.
+type MovieWeights struct {
+	Res4K              int  `json:"res_4k"`
+	Res1080p           int  `json:"res_1080p"`
+	DolbyVision        int  `json:"dolby_vision"`
+	HDR                int  `json:"hdr"`
+	Atmos              int  `json:"atmos"`
+	Audio51            int  `json:"audio_5_1"`
+	StereoPenalty      int  `json:"stereo_penalty"`      // applied when stereo/aac/mp3/2.0 matches
+	NeutralAudioBonus  int  `json:"neutral_audio_bonus"` // applied when no audio tag matches at all
+	RemuxBonus         int  `json:"remux_bonus"`
+	ItaBonus           int  `json:"ita_bonus"`
+	UnknownSizePenalty int  `json:"unknown_size_penalty"` // applied when 4K release has no parsed size
+	SeederWeight       int  `json:"seeder_weight"`
+	SeederCap          int  `json:"seeder_cap"`
+	Disable4K          bool `json:"disable_4k"`
 }
 
-// TVQualityWeights extends QualityWeights with TV-specific bonuses.
-type TVQualityWeights struct {
-	QualityWeights
-	FullpackBonus int `json:"fullpack_bonus"`
+// DefaultMovieWeights returns the weights matching the engine's previous
+// hardcoded behavior (before this became configurable).
+func DefaultMovieWeights() MovieWeights {
+	return MovieWeights{
+		Res4K:              1000,
+		Res1080p:           200,
+		DolbyVision:        100,
+		HDR:                60,
+		Atmos:              50,
+		Audio51:            25,
+		StereoPenalty:      -50,
+		NeutralAudioBonus:  5,
+		RemuxBonus:         30,
+		ItaBonus:           60,
+		UnknownSizePenalty: -5,
+		SeederWeight:       1,
+		SeederCap:          50,
+		Disable4K:          false,
+	}
 }
 
-// QualityScoringConfig holds optional quality scoring profiles.
+// UnmarshalJSON starts from DefaultMovieWeights() so a partial JSON object
+// (e.g. only {"seeder_weight": 1000}) only overrides the fields it mentions,
+// instead of zeroing out everything else.
+func (w *MovieWeights) UnmarshalJSON(data []byte) error {
+	*w = DefaultMovieWeights()
+	type alias MovieWeights
+	return json.Unmarshal(data, (*alias)(w))
+}
+
+// TVWeights defines scoring weights used by the TV sync engine
+// (internal/syncer/engines/tv_go.go, calculateQualityScore/classifyStream).
+//
+// SeederWeight/SeederCap replace the old stepped bonus (+10/+50/+100 at
+// 20/50/100 seeders) with a linear min(seeders, SeederCap) * SeederWeight,
+// so it can be weighted arbitrarily high, same as for movies.
+//
+// Disable4K, when true, rejects 4K releases during classification so only
+// 1080p is ever selected.
+type TVWeights struct {
+	Res4K         int  `json:"res_4k"`
+	Res1080p      int  `json:"res_1080p"`
+	HDR           int  `json:"hdr"`
+	Atmos         int  `json:"atmos"`
+	Audio51       int  `json:"audio_5_1"`
+	ItaBonus      int  `json:"ita_bonus"`
+	FullpackBonus int  `json:"fullpack_bonus"`
+	SeederWeight  int  `json:"seeder_weight"`
+	SeederCap     int  `json:"seeder_cap"`
+	Disable4K     bool `json:"disable_4k"`
+}
+
+// DefaultTVWeights returns the weights matching the engine's previous
+// hardcoded behavior (before this became configurable). The seeder cap of
+// 100 with weight 1 approximates the old top step (+100 at >=100 seeders).
+func DefaultTVWeights() TVWeights {
+	return TVWeights{
+		Res4K:         1000,
+		Res1080p:      200,
+		HDR:           100,
+		Atmos:         50,
+		Audio51:       25,
+		ItaBonus:      40,
+		FullpackBonus: 500,
+		SeederWeight:  1,
+		SeederCap:     100,
+		Disable4K:     false,
+	}
+}
+
+// UnmarshalJSON starts from DefaultTVWeights(), see MovieWeights.UnmarshalJSON.
+func (w *TVWeights) UnmarshalJSON(data []byte) error {
+	*w = DefaultTVWeights()
+	type alias TVWeights
+	return json.Unmarshal(data, (*alias)(w))
+}
+
+// QualityScoringConfig holds optional quality scoring profiles for the
+// Movie and TV sync engines. Both are optional (nil = use engine defaults);
+// when present, any field omitted from the JSON object falls back to the
+// engine's default for that field (see MovieWeights/TVWeights UnmarshalJSON).
 type QualityScoringConfig struct {
-	Movies *QualityWeights   `json:"movies,omitempty"`
-	TV     *TVQualityWeights `json:"tv,omitempty"`
+	Movies *MovieWeights `json:"movies,omitempty"`
+	TV     *TVWeights    `json:"tv,omitempty"`
 }
 
 // LanguageConfig controls preferred/excluded audio-language matching used

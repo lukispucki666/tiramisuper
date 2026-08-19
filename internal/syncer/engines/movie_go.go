@@ -39,6 +39,7 @@ type MovieGoEngine struct {
 	stateDir  string
 	limiter   *rate.Limiter
 	logger    *log.Logger
+	weights   config.MovieWeights
 
 	// Negative caches
 	noMKVCache     map[string]CacheEntry
@@ -98,20 +99,14 @@ type MovieEngineConfig struct {
 	// InvalidatePath, when set, is called after removing a stub file so the FUSE
 	// layer drops its cached state for it (see main.invalidateSyncRemovedPath).
 	InvalidatePath func(string)
+	// Weights configures scoring weights for stream selection. Zero-value
+	// (nil) means "use config.DefaultMovieWeights()".
+	Weights *config.MovieWeights
 }
 
-// Movie thresholds
+// Movie thresholds (non-scoring, still hardcoded on purpose: these are
+// sanity/size bounds, not quality preferences).
 const (
-	mMovie4KBase         = 1000
-	mMovie1080pBase      = 200
-	mMovieHDRBonus       = 60
-	mMovieDVBonus        = 100
-	mMovieAtmosBonus     = 50
-	mMovie51Bonus        = 25
-	mMovieStereoPenalty  = -50
-	mMovieRemuxBonus     = 30
-	mMovieITABonus       = 60
-	mMovieUnknownPenalty = -5
 	mMovieMinSeeders     = 15
 	mMovie4KMinGB        = 10
 	mMovie4KMaxGB        = 40
@@ -161,7 +156,13 @@ func NewMovieGoEngine(cfg MovieEngineConfig) *MovieGoEngine {
 	logFile, _ := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	logger := log.New(io.MultiWriter(os.Stdout, logFile), "[MovieSync] ", log.LstdFlags)
 
+	weights := config.DefaultMovieWeights()
+	if cfg.Weights != nil {
+		weights = *cfg.Weights
+	}
+
 	e := &MovieGoEngine{
+		weights:   weights,
 		gostorm:   NewGoStormClient(cfg.GoStormURL),
 		tmdb:      tmdb.NewClient(cfg.TMDBAPIKey),
 		torrentio: torrentio.NewClient(cfg.TorrentioURL, "sort=qualitysize|qualityfilter=480p,720p,scr,cam"),
@@ -417,7 +418,7 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 	existing := existingIndex[imdbID]
 	recheckTTL := recheckNoFileTTL
 	if existing.path != "" {
-		if existing.score >= mMovie4KBase {
+		if existing.score >= e.weights.Res4K {
 			recheckTTL = recheckCacheTTL
 		} else {
 			recheckTTL = recheck1080pTTL
@@ -634,6 +635,10 @@ func (e *MovieGoEngine) classifyMovieStream(s prowlarr.Stream) (*MovieStream, st
 	is4K := reM4K.MatchString(fullText)
 	is1080p := reM1080p.MatchString(fullText) && !reM720p.MatchString(fullText)
 
+	if is4K && e.weights.Disable4K {
+		return nil, "4k_disabled"
+	}
+
 	if !is4K && !is1080p {
 		return nil, "resolution_unknown"
 	}
@@ -667,47 +672,48 @@ func (e *MovieGoEngine) classifyMovieStream(s prowlarr.Stream) (*MovieStream, st
 }
 
 func (e *MovieGoEngine) calculateMovieScore(text string, seeders int, sizeGB float64, is4K bool) int {
+	w := e.weights
 	score := 0
 
 	if is4K {
-		score += mMovie4KBase
+		score += w.Res4K
 	} else {
-		score += mMovie1080pBase
+		score += w.Res1080p
 	}
 
 	if reMDV.MatchString(text) {
-		score += mMovieDVBonus
+		score += w.DolbyVision
 	} else if reMHDR.MatchString(text) {
-		score += mMovieHDRBonus
+		score += w.HDR
 	}
 
 	if reMAtmos.MatchString(text) {
-		score += mMovieAtmosBonus
+		score += w.Atmos
 	} else if reM51.MatchString(text) {
-		score += mMovie51Bonus
+		score += w.Audio51
 	} else if reMStereo.MatchString(text) {
-		score += mMovieStereoPenalty
+		score += w.StereoPenalty
 	} else {
-		score += 5
+		score += w.NeutralAudioBonus
 	}
 
 	if reMRemux.MatchString(text) {
-		score += mMovieRemuxBonus
+		score += w.RemuxBonus
 	}
 
 	if e.reITA.MatchString(text) {
-		score += mMovieITABonus
+		score += w.ItaBonus
 	}
 
 	if sizeGB == 0 && is4K {
-		score += mMovieUnknownPenalty
+		score += w.UnknownSizePenalty
 	}
 
 	seederBonus := seeders
-	if seederBonus > 50 {
-		seederBonus = 50
+	if seederBonus > w.SeederCap {
+		seederBonus = w.SeederCap
 	}
-	score += seederBonus
+	score += seederBonus * w.SeederWeight
 
 	return score
 }

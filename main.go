@@ -4046,6 +4046,7 @@ func main() {
 				ProwlarrCfg:    gc().Prowlarr,
 				Language:       gc().Language,
 				InvalidatePath: invalidateSyncRemovedPath,
+				Weights:        gc().QualityScoringConfig.Movies,
 			}),
 			"tv": engines.NewTVSyncer(engines.TVSyncerConfig{
 				GoStormURL:     gc().GoStormBaseURL,
@@ -4061,6 +4062,7 @@ func main() {
 				Language:       gc().Language,
 				DB:             stateDB,
 				InvalidatePath: invalidateSyncRemovedPath,
+				Weights:        gc().QualityScoringConfig.TV,
 			}),
 			"watchlist": engines.NewWatchlistSyncer(engines.WatchlistSyncerConfig{
 				GoStormURL:      gc().GoStormBaseURL,
