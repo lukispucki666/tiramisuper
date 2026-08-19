@@ -1,0 +1,594 @@
+package config
+
+import (
+	"encoding/json"
+	"log"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+	"tiramisu/internal/prowlarr"
+
+	"github.com/google/uuid"
+)
+
+// NatPMPConfig holds the configuration for NAT-PMP port forwarding.
+type NatPMPConfig struct {
+	Enabled      bool   `json:"enabled"`
+	Gateway      string `json:"gateway"`
+	LocalPort    int    `json:"local_port"`
+	VPNInterface string `json:"vpn_interface"`
+	Lifetime     int    `json:"lifetime"`
+	Refresh      int    `json:"refresh"`
+}
+
+// DailyJobConfig: task that can run on specific days of the week.
+// DaysOfWeek uses JS convention: 0=Sunday … 6=Saturday.
+type DailyJobConfig struct {
+	Enabled    bool  `json:"enabled"`
+	DaysOfWeek []int `json:"days_of_week"` // 0=Sun, 1=Mon, …, 6=Sat
+	Hour       int   `json:"hour"`
+	Minute     int   `json:"minute"`
+}
+
+type WatchlistSyncConfig struct {
+	Enabled       bool `json:"enabled"`
+	IntervalHours int  `json:"interval_hours"` // 1,2,3,4,6,8,12,24
+}
+
+type SchedulerConfig struct {
+	Enabled       bool                `json:"enabled"`
+	MoviesSync    DailyJobConfig      `json:"movies_sync"`
+	TVSync        DailyJobConfig      `json:"tv_sync"`
+	WatchlistSync WatchlistSyncConfig `json:"watchlist_sync"`
+}
+
+// EngineConfig holds per-engine paths for subprocess sync.
+type EngineConfig struct {
+	ScriptPath string
+	LogsDir    string
+}
+
+// MovieWeights defines scoring weights used by the Movie sync engine
+// (internal/syncer/engines/movie_go.go, calculateMovieScore/classifyMovieStream).
+//
+// SeederWeight/SeederCap replace the old hardcoded "score += min(seeders, 50)":
+// the contribution is now min(seeders, SeederCap) * SeederWeight, so setting
+// SeederWeight high (e.g. 1000) lets seeders dominate every other field.
+//
+// Disable4K, when true, makes the engine reject 4K releases outright during
+// classification, so 1080p is always chosen instead. This exists because 4K
+// and 1080p candidates are filtered into separate pools before scoring, and
+// any available 4K pool always wins regardless of score — a negative Res4K
+// weight alone would NOT be enough to make 1080p win.
+type MovieWeights struct {
+	Res4K              int  `json:"res_4k"`
+	Res1080p           int  `json:"res_1080p"`
+	DolbyVision        int  `json:"dolby_vision"`
+	HDR                int  `json:"hdr"`
+	Atmos              int  `json:"atmos"`
+	Audio51            int  `json:"audio_5_1"`
+	StereoPenalty      int  `json:"stereo_penalty"`      // applied when stereo/aac/mp3/2.0 matches
+	NeutralAudioBonus  int  `json:"neutral_audio_bonus"` // applied when no audio tag matches at all
+	RemuxBonus         int  `json:"remux_bonus"`
+	ItaBonus           int  `json:"ita_bonus"`
+	UnknownSizePenalty int  `json:"unknown_size_penalty"` // applied when 4K release has no parsed size
+	SeederWeight       int  `json:"seeder_weight"`
+	SeederCap          int  `json:"seeder_cap"`
+	Disable4K          bool `json:"disable_4k"`
+}
+
+// DefaultMovieWeights returns the weights matching the engine's previous
+// hardcoded behavior (before this became configurable).
+func DefaultMovieWeights() MovieWeights {
+	return MovieWeights{
+		Res4K:              1000,
+		Res1080p:           200,
+		DolbyVision:        100,
+		HDR:                60,
+		Atmos:              50,
+		Audio51:            25,
+		StereoPenalty:      -50,
+		NeutralAudioBonus:  5,
+		RemuxBonus:         30,
+		ItaBonus:           60,
+		UnknownSizePenalty: -5,
+		SeederWeight:       1,
+		SeederCap:          50,
+		Disable4K:          false,
+	}
+}
+
+// UnmarshalJSON starts from DefaultMovieWeights() so a partial JSON object
+// (e.g. only {"seeder_weight": 1000}) only overrides the fields it mentions,
+// instead of zeroing out everything else.
+func (w *MovieWeights) UnmarshalJSON(data []byte) error {
+	*w = DefaultMovieWeights()
+	type alias MovieWeights
+	return json.Unmarshal(data, (*alias)(w))
+}
+
+// TVWeights defines scoring weights used by the TV sync engine
+// (internal/syncer/engines/tv_go.go, calculateQualityScore/classifyStream).
+//
+// SeederWeight/SeederCap replace the old stepped bonus (+10/+50/+100 at
+// 20/50/100 seeders) with a linear min(seeders, SeederCap) * SeederWeight,
+// so it can be weighted arbitrarily high, same as for movies.
+//
+// Disable4K, when true, rejects 4K releases during classification so only
+// 1080p is ever selected.
+type TVWeights struct {
+	Res4K         int  `json:"res_4k"`
+	Res1080p      int  `json:"res_1080p"`
+	HDR           int  `json:"hdr"`
+	Atmos         int  `json:"atmos"`
+	Audio51       int  `json:"audio_5_1"`
+	ItaBonus      int  `json:"ita_bonus"`
+	FullpackBonus int  `json:"fullpack_bonus"`
+	SeederWeight  int  `json:"seeder_weight"`
+	SeederCap     int  `json:"seeder_cap"`
+	Disable4K     bool `json:"disable_4k"`
+}
+
+// DefaultTVWeights returns the weights matching the engine's previous
+// hardcoded behavior (before this became configurable). The seeder cap of
+// 100 with weight 1 approximates the old top step (+100 at >=100 seeders).
+func DefaultTVWeights() TVWeights {
+	return TVWeights{
+		Res4K:         1000,
+		Res1080p:      200,
+		HDR:           100,
+		Atmos:         50,
+		Audio51:       25,
+		ItaBonus:      40,
+		FullpackBonus: 500,
+		SeederWeight:  1,
+		SeederCap:     100,
+		Disable4K:     false,
+	}
+}
+
+// UnmarshalJSON starts from DefaultTVWeights(), see MovieWeights.UnmarshalJSON.
+func (w *TVWeights) UnmarshalJSON(data []byte) error {
+	*w = DefaultTVWeights()
+	type alias TVWeights
+	return json.Unmarshal(data, (*alias)(w))
+}
+
+// QualityScoringConfig holds optional quality scoring profiles for the
+// Movie and TV sync engines. Both are optional (nil = use engine defaults);
+// when present, any field omitted from the JSON object falls back to the
+// engine's default for that field (see MovieWeights/TVWeights UnmarshalJSON).
+type QualityScoringConfig struct {
+	Movies *MovieWeights `json:"movies,omitempty"`
+	TV     *TVWeights    `json:"tv,omitempty"`
+}
+
+// LanguageConfig controls preferred/excluded audio-language matching used
+// by the Movie and TV sync engines when scoring and filtering torrents.
+type LanguageConfig struct {
+	// PreferredTerms are case-insensitive, word-boundary-matched release-name terms (e.g. "ita", "multi", "dual").
+	PreferredTerms []string `json:"preferred_terms"`
+	// PreferredFlags/ExcludedFlags are ISO 3166-1 alpha-2 codes matched against flag emoji in indexer result lines.
+	PreferredFlags []string `json:"preferred_flags"`
+	ExcludedFlags  []string `json:"excluded_flags"`
+}
+
+// Config holds all configurable parameters for the FUSE proxy
+type Config struct {
+	// --- Internal / Derived Fields ---
+	ConfigPath string `json:"-"`
+	RootPath   string `json:"-"` // V138: Root path for state/config (default: /home/pi)
+
+	// --- Core Tuning (JSON Mapped) ---
+	MasterConcurrencyLimit int    `json:"master_concurrency_limit"` // Global limit for concurrent HTTP requests to GoStorm
+	ReadAheadBudgetMB      int64  `json:"read_ahead_budget_mb"`     // Global budget for read-ahead in MB
+	MetadataCacheSizeMB    int64  `json:"metadata_cache_size_mb"`   // Size of metadata LRU cache in MB (V178)
+	FuseBlockSize          int    `json:"fuse_block_size_bytes"`
+	StreamingThresholdKB   int64  `json:"streaming_threshold_kb"`
+	LogLevel               string `json:"log_level"`
+
+	// --- FUSE Timing ---
+	AttrTimeoutSeconds     float64 `json:"attr_timeout_seconds"`
+	EntryTimeoutSeconds    float64 `json:"entry_timeout_seconds"`
+	NegativeTimeoutSeconds float64 `json:"negative_timeout_seconds"`
+
+	// --- HTTP Resilience ---
+	MaxRetryAttempts         int `json:"max_retry_attempts"`
+	RetryDelayMS             int `json:"retry_delay_ms"`
+	RescueGracePeriodSeconds int `json:"rescue_grace_period_seconds"`
+	RescueCooldownHours      int `json:"rescue_cooldown_hours"`
+
+	// --- Preload Engine ---
+	PreloadWorkersCount   int `json:"preload_workers_count"`
+	PreloadInitialDelayMS int `json:"preload_initial_delay_ms"`
+	WarmStartIdleSeconds  int `json:"warm_start_idle_seconds"`
+	MaxConcurrentPrefetch int `json:"max_concurrent_prefetch"`
+
+	// --- Cache Management ---
+	CacheCleanupIntervalMin int `json:"cache_cleanup_interval_min"`
+	MaxCacheEntries         int `json:"max_cache_entries"`
+
+	// --- Connectivity ---
+	GoStormBaseURL   string `json:"gostorm_url"`
+	ProxyListenPort  int    `json:"proxy_listen_port"`
+	MetricsPort      int    `json:"metrics_port"`
+	BlockListEnabled bool   `json:"blocklist_enabled"`
+	BlockListURL     string `json:"blocklist_url"`
+	AIURL            string `json:"ai_url"`      // V1.4.5: AI Optimizer sidecar URL
+	AIProvider       string `json:"ai_provider"` // V1.7.1: Provider type (local, openrouter, openai)
+	AIModel          string `json:"ai_model"`    // V1.7.1: Model ID for cloud providers
+	AI_API_KEY       string `json:"ai_api_key"`  // V1.7.1: API key for cloud providers
+
+	// --- FUSE Paths ---
+	// Fallback when CLI args are omitted. CLI args always take precedence.
+	PhysicalSourcePath string `json:"physical_source_path"` // Real MKV dir (e.g. /mnt/torrserver)
+	FuseMountPath      string `json:"fuse_mount_path"`      // FUSE virtual mount (e.g. /mnt/torrserver-go)
+
+	// --- Legacy Compatibility Fields (populated from above) ---
+	DefaultFileSize         int64         `json:"-"`
+	ReadAheadBudget         int64         `json:"-"`
+	MetadataCacheSize       int64         `json:"-"` // V178
+	ReadAheadBase           int64         `json:"-"`
+	ReadAheadInitial        int64         `json:"-"`
+	StreamingThreshold      int64         `json:"-"`
+	SequentialTolerance     int64         `json:"-"`
+	MaxConcurrentHTTP       int           `json:"-"`
+	RateLimitRequestsPerSec int           `json:"-"`
+	PreloadWorkers          int           `json:"-"`
+	MaxConnsPerHost         int           `json:"-"`
+	ConcurrencyLimit        int           `json:"-"`
+	KeepaliveInterval       time.Duration `json:"-"`
+	KeepaliveIdleStart      time.Duration `json:"-"`
+	KeepaliveMaxIdle        time.Duration `json:"-"`
+	CacheTTL                time.Duration `json:"-"`
+	UID                     uint32        `json:"-"`
+	GID                     uint32        `json:"-"`
+
+	// --- Disk Warmup ---
+	DiskWarmupQuotaGB int64 `json:"disk_warmup_quota_gb"` // Total SSD quota for warmup cache (default: 32)
+	// Deprecated: warmupFileSize is now hardcoded at 64MB. Field kept for
+	// backward-compatible JSON unmarshal of existing config.json files.
+	WarmupHeadSizeMB int64 `json:"warmup_head_size_mb"`
+
+	// --- NAT-PMP (V228) ---
+	NatPMP NatPMPConfig `json:"natpmp"`
+
+	// --- External Services (V1.4.6) ---
+	Plex struct {
+		URL         string `json:"url"`
+		Token       string `json:"token"`
+		LibraryID   int    `json:"library_id"`
+		TVLibraryID int    `json:"tv_library_id"`
+	} `json:"plex"`
+	TMDBAPIKey   string `json:"tmdb_api_key"`
+	TorrentioURL string `json:"torrentio_url"` // Torrentio base URL (used when Prowlarr is disabled)
+
+	// --- Prowlarr Indexer ---
+	Prowlarr prowlarr.ConfigProwlarr `json:"prowlarr"`
+
+	// --- Built-in Sync Scheduler ---
+	Scheduler SchedulerConfig `json:"scheduler"`
+
+	// --- Media Server ---
+	MediaServerType string `json:"media_server_type"` // "plex" | "jellyfin"
+
+	// --- Quality Scoring ---
+	QualityScoringConfig QualityScoringConfig `json:"quality_scoring"`
+
+	// --- Language Matching ---
+	Language LanguageConfig `json:"language"`
+
+	// --- Engine Scripts (populated in LoadConfig, not from JSON) ---
+	EngineScripts map[string]EngineConfig `json:"-"`
+
+	// --- Telemetry (V1.4.7) ---
+	TelemetryID     string `json:"telemetry_id"`
+	EnableTelemetry bool   `json:"telemetry"`
+	TelemetryURL    string `json:"telemetry_url"`
+
+	// --- State DB (V1.7.1) ---
+	EnableStateDB bool   `json:"enable_state_db"` // default: true
+	StateDBPath   string `json:"state_db_path"`   // default: <STATE>/tiramisu.db
+}
+
+// Save persists the current configuration to config.json
+func (c *Config) Save() error {
+	// 1. Marshal config to JSON
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// 2. Write to file
+	return os.WriteFile(c.ConfigPath, data, 0644)
+}
+
+// LoadConfig loads configuration from environment variables with defaults
+func LoadConfig() Config {
+	// 1. Initial Defaults (V138 Gold Standard)
+	cfg := Config{
+		MasterConcurrencyLimit: 25,
+		ReadAheadBudgetMB:      256,
+		MetadataCacheSizeMB:    50, // Default 50MB for metadata
+		FuseBlockSize:          1048576,
+		StreamingThresholdKB:   128,
+		LogLevel:               "INFO",
+
+		AttrTimeoutSeconds:     1.0,
+		EntryTimeoutSeconds:    1.0,
+		NegativeTimeoutSeconds: 0.0,
+
+		MaxRetryAttempts: 6,
+		RetryDelayMS:     500,
+
+		PreloadWorkersCount:   4,
+		PreloadInitialDelayMS: 1000,
+		WarmStartIdleSeconds:  6,
+		MaxConcurrentPrefetch: 3,
+
+		CacheCleanupIntervalMin: 5,
+		MaxCacheEntries:         10000,
+		DiskWarmupQuotaGB:       15,
+		WarmupHeadSizeMB:        64,
+
+		Language: LanguageConfig{
+			PreferredTerms: []string{"ita", "multi", "dual"},
+			PreferredFlags: []string{"IT"},
+			ExcludedFlags: []string{
+				"ES", "FR", "DE", "RU", "CN", "JP", "KR", "TH", "PT", "BR",
+				"UA", "PL", "NL", "TR", "SA", "IN", "CZ", "HU", "RO",
+			},
+		},
+
+		Scheduler: SchedulerConfig{
+			Enabled:       false, // off by default — won't break installs using cron
+			MoviesSync:    DailyJobConfig{Enabled: true, DaysOfWeek: []int{1, 4}, Hour: 3, Minute: 0},
+			TVSync:        DailyJobConfig{Enabled: true, DaysOfWeek: []int{3, 5}, Hour: 4, Minute: 0},
+			WatchlistSync: WatchlistSyncConfig{Enabled: true, IntervalHours: 1},
+		},
+
+		TorrentioURL:     "https://torrentio.strem.fun",
+		GoStormBaseURL:   "http://127.0.0.1:8090",
+		ProxyListenPort:  8080,
+		MetricsPort:      9080,
+		BlockListEnabled: false,
+
+		EnableTelemetry: true,
+		TelemetryURL:    "https://telemetry.gostream.workers.dev",
+
+		EnableStateDB: true,
+
+		// Legacy Fixed Defaults
+		DefaultFileSize:         30 * 1024 * 1024 * 1024,
+		ReadAheadBase:           16 * 1024 * 1024,
+		ReadAheadInitial:        16 * 1024 * 1024,
+		SequentialTolerance:     512 * 1024,
+		RateLimitRequestsPerSec: 500,
+		KeepaliveInterval:       15 * time.Second,
+		KeepaliveIdleStart:      8 * time.Second,
+		KeepaliveMaxIdle:        600 * time.Second,
+		CacheTTL:                10 * time.Second,
+		UID:                     1000,
+		GID:                     1000,
+	}
+
+	// 2. Resolve Config Path — always co-located with the binary
+	if p := os.Getenv("MKV_PROXY_CONFIG_PATH"); p != "" {
+		cfg.ConfigPath = p
+	} else {
+		exe, err := os.Executable()
+		if err == nil {
+			cfg.ConfigPath = filepath.Join(filepath.Dir(exe), "config.json")
+		} else {
+			cfg.ConfigPath = "config.json" // fallback: CWD
+		}
+	}
+
+	// 3. Try to load JSON
+	if data, err := os.ReadFile(cfg.ConfigPath); err == nil {
+		// V138: Support comments in JSON by stripping them before unmarshaling
+		cleanData := stripJSONComments(data)
+		if err := json.Unmarshal(cleanData, &cfg); err != nil {
+			log.Printf("[Config] WARNING: Failed to parse %s: %v", cfg.ConfigPath, err)
+		} else {
+			log.Printf("[Config] Loaded settings from %s", cfg.ConfigPath)
+			// Backward compat: if gostorm_url was not present in config, fall back to legacy torrserver_url key
+			if cfg.GoStormBaseURL == "" {
+				var raw map[string]json.RawMessage
+				if json.Unmarshal(cleanData, &raw) == nil {
+					if v, ok := raw["torrserver_url"]; ok {
+						var s string
+						if json.Unmarshal(v, &s) == nil && s != "" {
+							cfg.GoStormBaseURL = s
+							log.Printf("[Config] Loaded GoStormBaseURL from legacy key 'torrserver_url': %s", s)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Override from environment (Highest Priority)
+	cfg.applyEnvOverrides()
+
+	// 5. Finalize and map derived fields
+	cfg.finalize()
+
+	// 5b. Populate engine script paths
+	exe, _ := os.Executable()
+	binDir := filepath.Dir(exe)
+	scriptsDir := filepath.Join(binDir, "scripts")
+	logsDir := filepath.Join(binDir, "logs")
+	cfg.EngineScripts = map[string]EngineConfig{
+		"movies":    {ScriptPath: filepath.Join(scriptsDir, "gostorm-sync-complete.py"), LogsDir: logsDir},
+		"tv":        {ScriptPath: filepath.Join(scriptsDir, "gostorm-tv-sync.py"), LogsDir: logsDir},
+		"watchlist": {ScriptPath: filepath.Join(scriptsDir, "plex-watchlist-sync.py"), LogsDir: logsDir},
+	}
+
+	// 6. Generate Telemetry ID if missing
+	if cfg.TelemetryID == "" {
+		cfg.TelemetryID = uuid.New().String()
+		log.Printf("[Telemetry] Generated new ID: %s", cfg.TelemetryID)
+		if err := cfg.Save(); err != nil {
+			log.Printf("[Telemetry] ERROR: Failed to persist generated ID: %v", err)
+		}
+	}
+
+	return cfg
+}
+
+// stripJSONComments removes // comments from JSON data and preserves valid syntax.
+// It is careful not to strip // when part of a URL (e.g., http://).
+func stripJSONComments(data []byte) []byte {
+	lines := strings.Split(string(data), "\n")
+	var result []string
+	for _, line := range lines {
+		// Find // but only if not preceded by : (simple check for http://)
+		idx := strings.Index(line, "//")
+		if idx != -1 {
+			if idx > 0 && line[idx-1] == ':' {
+				// It's likely a URL, look for another // later in the line
+				secondIdx := strings.Index(line[idx+2:], "//")
+				if secondIdx != -1 {
+					line = line[:idx+2+secondIdx]
+				}
+			} else {
+				line = line[:idx]
+			}
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return []byte(strings.Join(result, " "))
+}
+
+func (c *Config) applyEnvOverrides() {
+	if v := os.Getenv("MKV_PROXY_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.MasterConcurrencyLimit = n
+		}
+	}
+	if v := os.Getenv("MKV_PROXY_READ_AHEAD_BUDGET"); v != "" {
+		if size, err := parseBytes(v); err == nil {
+			c.ReadAheadBudgetMB = size / (1024 * 1024)
+		}
+	}
+	if v := os.Getenv("MKV_PROXY_GOSTORM_URL"); v != "" {
+		c.GoStormBaseURL = v
+	}
+	if v := os.Getenv("MKV_PROXY_AI_URL"); v != "" {
+		c.AIURL = v
+	}
+	if v := os.Getenv("AI_PROVIDER"); v != "" {
+		c.AIProvider = v
+	}
+	if v := os.Getenv("AI_MODEL"); v != "" {
+		c.AIModel = v
+	}
+	if v := os.Getenv("AI_API_KEY"); v != "" {
+		c.AI_API_KEY = v
+	}
+	if v := firstEnv("TIRAMISU_PLEX_URL", "GOSTREAM_PLEX_URL", "PLEX_URL"); v != "" {
+		c.Plex.URL = v
+	}
+	if v := firstEnv("TIRAMISU_PLEX_TOKEN", "GOSTREAM_PLEX_TOKEN", "PLEX_TOKEN"); v != "" {
+		c.Plex.Token = v
+	}
+	if v := os.Getenv("MKV_PROXY_LOG_LEVEL"); v != "" {
+		c.LogLevel = v
+	}
+	if v := os.Getenv("MKV_PROXY_UID"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 32); err == nil {
+			c.UID = uint32(n)
+		}
+	}
+	if v := os.Getenv("MKV_PROXY_GID"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 32); err == nil {
+			c.GID = uint32(n)
+		}
+	}
+}
+
+func firstEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (c *Config) finalize() {
+	// Sync legacy fields with unified master limit
+	c.ConcurrencyLimit = c.MasterConcurrencyLimit
+	c.MaxConcurrentHTTP = c.MasterConcurrencyLimit
+	c.MaxConnsPerHost = c.MasterConcurrencyLimit
+
+	// Map JSON fields to internal logic fields
+	// Calculate ReadAheadBudget in bytes
+	c.ReadAheadBudget = c.ReadAheadBudgetMB * 1024 * 1024
+	if c.ReadAheadBudget < 10*1024*1024 {
+		c.ReadAheadBudget = 10 * 1024 * 1024 // Min 10MB
+	}
+	// Budget must cover at least one adaptive chunk (ReadAheadBase, up to 16MB): a smaller
+	// budget makes every pump Put() exceed it permanently (the just-added chunk is exempt from
+	// eviction), turning the soft-limit throttle in nativePumpChunk into a permanent near-freeze.
+	if c.ReadAheadBudget < c.ReadAheadBase {
+		c.ReadAheadBudget = c.ReadAheadBase
+	}
+
+	// Calculate MetadataCacheSize in bytes
+	c.MetadataCacheSize = c.MetadataCacheSizeMB * 1024 * 1024
+	if c.MetadataCacheSize < 1*1024*1024 {
+		c.MetadataCacheSize = 1 * 1024 * 1024 // Min 1MB
+	}
+
+	c.StreamingThreshold = c.StreamingThresholdKB * 1024
+	c.PreloadWorkers = c.PreloadWorkersCount
+	if c.MaxConcurrentPrefetch <= 0 {
+		c.MaxConcurrentPrefetch = 3 // Safety fallback
+	}
+}
+
+// parseBytes parses byte size strings like "80MB", "128KB", "1GB"
+func parseBytes(s string) (int64, error) {
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, nil
+	}
+	multipliers := map[string]int64{
+		"KB": 1024, "MB": 1024 * 1024, "GB": 1024 * 1024 * 1024,
+		"K": 1024, "M": 1024 * 1024, "G": 1024 * 1024 * 1024,
+	}
+	for suffix, mult := range multipliers {
+		if len(s) > len(suffix) && s[len(s)-len(suffix):] == suffix {
+			numPart := s[:len(s)-len(suffix)]
+			if n, err := strconv.ParseInt(numPart, 10, 64); err == nil {
+				return n * mult, nil
+			}
+		}
+	}
+	return 0, strconv.ErrSyntax
+}
+
+// LogConfig logs the active configuration
+func (c *Config) LogConfig(logger *log.Logger) {
+	logger.Printf("=== Configuration ===")
+	logger.Printf("Source: %s", c.ConfigPath)
+	logger.Printf("MasterConcurrencyLimit: %d", c.MasterConcurrencyLimit)
+	logger.Printf("ReadAheadBudget: %d MB", c.ReadAheadBudgetMB)
+	logger.Printf("FUSE Block Size: %d", c.FuseBlockSize)
+	logger.Printf("StreamingThreshold: %d KB", c.StreamingThresholdKB)
+	logger.Printf("LogLevel: %s", c.LogLevel)
+	logger.Printf("GoStormBaseURL: %s", c.GoStormBaseURL)
+	logger.Printf("FUSE Timeouts (Attr/Entry/Neg): %.1f/%.1f/%.1f", c.AttrTimeoutSeconds, c.EntryTimeoutSeconds, c.NegativeTimeoutSeconds)
+	logger.Printf("HTTP Retries: %d, Delay: %dms", c.MaxRetryAttempts, c.RetryDelayMS)
+	logger.Printf("Preload Engine: Workers=%d, Delay=%dms", c.PreloadWorkersCount, c.PreloadInitialDelayMS)
+
+	logger.Printf("Cache Management: Cleanup=%dm, MaxEntries=%d", c.CacheCleanupIntervalMin, c.MaxCacheEntries)
+	logger.Printf("Network: ProxyPort=%d, MetricsPort=%d", c.ProxyListenPort, c.MetricsPort)
+	logger.Printf("=====================")
+}
